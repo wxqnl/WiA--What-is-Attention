@@ -17,7 +17,10 @@
       "Bash(curl -L \"https://arxiv.org/pdf/1910.10683\" -o \"T5-Exploring-Limits-of-Transfer-Learning.pdf\" --silent --show-error)",
       "Bash(curl -L \"https://arxiv.org/pdf/1907.11692\" -o \"RoBERTa-Robustly-Optimized-BERT-Pretraining.pdf\" --silent --show-error)",
       "Bash(wait)",
-      "Bash(ls -lh GPT3*.pdf T5*.pdf RoBERTa*.pdf)"
+      "Bash(ls -lh GPT3*.pdf T5*.pdf RoBERTa*.pdf)",
+      "Bash(grep -c \"\\\\$\\\\$\" \"/Users/apple/Desktop/111111/What is Attention？/WiA/Attention/DeltaNet.md\")",
+      "Bash(grep -c \"^\\\\`\\\\`\\\\`python\" \"/Users/apple/Desktop/111111/What is Attention？/WiA/Attention/DeltaNet.md\")",
+      "mcp__web-search-prime__web_search_prime"
     ]
   }
 }

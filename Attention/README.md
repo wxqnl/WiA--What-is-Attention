@@ -7,10 +7,11 @@
 
 ### 第二阶段：大模型主线（Decoder-Only）
 2. [`GPT.md`](GPT.md)
-3. [`LLaMA.md`](LLaMA.md)（RoPE + GQA，开源大模型标准架构）
+3. [`LLaMA.md`](LLaMA.md)（RoPE + GQA + MLA，LLaMA 1-4 完整演化）
 4. [`BERT.md`](BERT.md)（双向 Encoder，理解任务的另一条路）
 5. [`Qwen.md`](Qwen.md)
-6. [`GLM.md`](GLM.md)
+6. [`Qwen3.5.md`](Qwen3.5.md)（Gated DeltaNet + GQA 混合架构 + MoE）
+7. [`GLM.md`](GLM.md)
 7. [`Mistral.md`](Mistral.md)
 8. [`Gemma.md`](Gemma.md)
 
@@ -18,15 +19,19 @@
 9. [`MQA.md`](MQA.md)（多查询注意力，KV Cache 压缩第一步）
 10. [`GQA.md`](GQA.md)（分组查询注意力，MQA 与 MHA 的折中）
 11. [`MLA.md`](MLA.md)（多头潜在注意力，DeepSeek 的低秩 KV 压缩）
+12. [`SWA.md`](SWA.md)（滑动窗口注意力，局部注意力 + 分层传播）
+13. [`FlashAttention.md`](FlashAttention.md)（IO 感知分块算法，exact attention 加速 3×）
 
 ### 第四阶段：稀疏与流式 Attention
-12. [`StreamingLLM.md`](StreamingLLM.md)（Attention Sink 现象 + 无限流式推理）
-13. [`NSA.md`](NSA.md)（原生稀疏 Attention，硬件对齐训练）
+14. [`StreamingLLM.md`](StreamingLLM.md)（Attention Sink 现象 + 无限流式推理）
+15. [`NSA.md`](NSA.md)（原生稀疏 Attention，硬件对齐训练）
 
 ### 第五阶段：超越 Transformer
-14. [`RWKV.md`](RWKV.md)
-15. [`GLA.md`](GLA.md)
-16. [`Mamba.md`](Mamba.md)（选择性状态空间，首个匹配 Transformer 的线性模型）
+16. [`RWKV.md`](RWKV.md)
+17. [`GLA.md`](GLA.md)
+18. [`Mamba.md`](Mamba.md)（选择性状态空间，首个匹配 Transformer 的线性模型）
+19. [`DeltaNet.md`](DeltaNet.md)（Delta 规则线性注意力，先擦后写）
+20. [`Gated-DeltaNet.md`](Gated-DeltaNet.md)（门控 DeltaNet，输入依赖的选择性记忆）
 
 ---
 
@@ -37,9 +42,10 @@
 |:---|:---|
 | Transformer | Multi-Head Attention、Encoder-Decoder、位置编码 |
 | GPT | Decoder-Only、Causal Masked Attention、自回归生成 |
-| LLaMA | RoPE 旋转位置编码、GQA、开源大模型标准架构 |
+| LLaMA | RoPE 旋转位置编码、GQA、MLA、LLaMA 1-4 完整演化 |
 | BERT | 双向 Self-Attention、MLM 预训练、Encoder-Only |
 | Qwen | RoPE、GQA、长上下文扩展 |
+| Qwen 3.5 | Gated DeltaNet + GQA 混合架构、MoE、262K 上下文 |
 | GLM | 双向 Attention、2D 位置编码、空白填充预训练 |
 | Mistral | Sliding Window Attention、GQA |
 | Gemma | 交替全局/局部 Attention |
@@ -50,6 +56,8 @@
 | MQA | 单 KV 头共享所有 Query，KV Cache 压缩 h 倍 |
 | GQA | Query 头分组，每组共享 KV，质量与效率的折中 |
 | MLA | 低秩 KV 压缩，KV Cache 压缩 93% |
+| SWA | 滑动窗口注意力，局部 O(NW) + 分层传播 = 大有效感受野 |
+| FlashAttention | IO-aware 分块，精确 Attention 加速 3×，内存 O(N) |
 
 ### 稀疏与流式注意力路线
 | 文章 | 核心主题 |
@@ -63,6 +71,8 @@
 | RWKV | 指数衰减线性 Attention、训练并行推理递推 |
 | GLA | 门控线性 Attention、数据相关门控 |
 | Mamba | 选择性状态空间模型、$\Delta$/B/C 输入相关、硬件感知扫描 |
+| DeltaNet | Delta 规则线性注意力、先擦后写记忆更新、Householder 并行化 |
+| Gated DeltaNet | 门控 DeltaNet、输入依赖衰减门、Mamba2 + Delta 规则统一 |
 
 ---
 
@@ -95,3 +105,5 @@
 - Mamba-2（统一 SSM 与 Attention 框架）
 - RetNet
 - S4（Mamba 的前身）
+- ~DeltaNet~（已完成 → `DeltaNet.md`）
+- ~Gated DeltaNet~（已完成 → `Gated-DeltaNet.md`）

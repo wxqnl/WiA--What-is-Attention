@@ -1,9 +1,10 @@
-# LLaMA 系列
+# LLaMA 系列：从开源革命到多模态前沿
 
 > 对应论文：
 > - `paper/LLaMA-LLaMA-Open-and-Efficient-Foundation-LMs.pdf`（Touvron et al., 2023）
 > - `paper/LLaMA2-Open-Foundation-and-Fine-Tuned-Chat-Models.pdf`（Touvron et al., 2023）
-> - LLaMA 3：[The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783)（Meta, 2024）
+> - `paper/LLaMA3-Llama3-Herd-of-Models.pdf`（Meta, 2024）
+> - `paper/LLaMA4-Herd-Architecture-Training.pdf`（Meta, 2025）
 
 ---
 
@@ -87,7 +88,7 @@ $$
 | 建模的关系 | 绝对位置 | 相对位置 |
 | 长度外推能力 | 弱（训练长度之外急剧退化） | 更强（可配合缩放策略扩展） |
 
-### 2.2 改动二：Pre-RMSNorm（非 Attention 改动，但影响训练稳定性）
+### 2.2 改动二：Pre-RMSNorm
 
 原始 Transformer 在 Attention 和 FFN **之后**做 LayerNorm（Post-Norm）。LLaMA 改为在 **之前**做，并将 LayerNorm 换成计算更轻量的 **RMSNorm**：
 
@@ -97,7 +98,32 @@ $$
 
 Pre-Norm 的好处是梯度更稳定，深层网络更容易训练。这不改变 Attention 的计算，但让 LLaMA 的架构更容易规模化。
 
-### 2.3 LLaMA 1 的完整注意力计算
+### 2.3 改动三：SwiGLU 激活函数
+
+LLaMA 将 FFN 中的 ReLU 激活函数替换为 **SwiGLU**，这是一种门控线性单元，计算公式为：
+
+$$
+\text{SwiGLU}(x, W, V, W_2) = (x W \odot \text{Swish}(x V)) W_2
+$$
+
+其中 $\text{Swish}(x) = x \cdot \sigma(x)$。这种激活函数在多个基准测试中表现更好。
+
+### 2.4 LLaMA 1 的架构超参数
+
+LLaMA 1 发布了四个规模的模型：
+
+| 模型 | 层数 | 隐藏维度 | 注意力头数 | 学习率 | 上下文长度 | 参数量 |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| LLaMA-7B | 32 | 4096 | 32 | 3.0e-4 | 2048 | 6.7B |
+| LLaMA-13B | 40 | 5120 | 40 | 3.0e-4 | 2048 | 13.0B |
+| LLaMA-33B | 60 | 6656 | 52 | 1.5e-4 | 2048 | 32.5B |
+| LLaMA-65B | 80 | 8192 | 64 | 1.5e-4 | 2048 | 65.2B |
+
+所有模型都使用 **Multi-Head Attention（MHA）**，每个头的维度为 $d_{\text{head}} = d_{\text{model}} / n_{\text{heads}}$。
+
+训练数据总量约 **1.4T tokens**，来源包括 CommonCrawl、C4、GitHub、Wikipedia、Books、ArXiv、StackExchange 等。
+
+### 2.5 LLaMA 1 的完整注意力计算
 
 把 RoPE 加进来后，一个 LLaMA 1 的注意力头计算如下：
 
@@ -107,11 +133,11 @@ def llama1_attention(x, W_Q, W_K, W_V, cos, sin, mask):
     Q = x @ W_Q    # (B, T, head_dim)
     K = x @ W_K
     V = x @ W_V
-
+    
     # 对 Q 和 K 施加 RoPE——这是与 GPT 的核心区别
     Q = apply_rope(Q, cos, sin)
     K = apply_rope(K, cos, sin)
-
+    
     # 标准因果注意力
     scores = (Q @ K.transpose(-2, -1)) / math.sqrt(Q.size(-1))
     scores = scores + mask     # 加上上三角 -inf 掩码
@@ -125,149 +151,613 @@ def llama1_attention(x, W_Q, W_K, W_V, cos, sin, mask):
 
 ## 3. LLaMA 2：引入 GQA，为长上下文做准备
 
-LLaMA 2 在 LLaMA 1 的基础上做了两处与 Attention 相关的改进：
+LLaMA 2 在 2023 年 7 月发布，相比 LLaMA 1 做了两处与 Attention 相关的重要改进。
 
 ### 3.1 GQA：用更少的 KV 头
 
-LLaMA 2 的 70B 版本引入了 **GQA（Grouped Query Attention，分组查询注意力）**。
+LLaMA 2 的 70B 版本引入了 **GQA（Grouped Query Attention，分组查询注意力）**。这是介于 Multi-Head Attention（MHA）和 Multi-Query Attention（MQA）之间的一种折中方案。
 
-标准 Multi-Head Attention（MHA）中，每个 Query 头都有一组专属的 K 和 V，假设有 $h$ 个头，就需要 $h$ 组 KV。在推理时，这些 KV 需要全部缓存起来（即 **KV Cache**），显存开销随着序列长度线性增长。
+#### 为什么需要 GQA
 
-GQA 的做法是：把 $h$ 个 Query 头分成若干**组**，每组共享同一对 K 和 V。例如 32 个 Query 头分 8 组，每组 4 个 Query 头共享 1 对 KV，KV 的数量就从 32 组降到了 8 组。
+在标准的 MHA 中，每个头都有自己独立的 Q、K、V 投影矩阵。假设有 32 个头，那就需要存储 32 组 K 和 V。
+
+在推理时，为了加速生成，模型会把已经计算过的 K 和 V 缓存起来（KV Cache），避免重复计算。但这个缓存的显存占用和头数成正比——头越多，缓存越大，推理速度越慢。
+
+**MQA（Multi-Query Attention）** 的激进做法是：所有头共享同一组 K 和 V，只有 Q 是每个头独立的。这样 KV Cache 的大小直接降到原来的 $1/n_{\text{heads}}$，但代价是模型质量会有一定下降。
+
+**GQA** 是一个中间方案：把多个 Q 头分成若干组，每组共享一组 K 和 V。比如 32 个 Q 头分成 8 组，每组 4 个头共享同一对 KV，那么 KV Cache 的大小就是 MHA 的 $1/4$。
+
+#### GQA 的数学表示
+
+假设有 $n_{\text{heads}}$ 个查询头，分成 $n_{\text{kv\_heads}}$ 组，每组有 $g = n_{\text{heads}} / n_{\text{kv\_heads}}$ 个查询头。
+
+对于第 $i$ 组（$i = 0, 1, \ldots, n_{\text{kv\_heads}} - 1$），该组内的所有查询头共享同一对 $K_i$ 和 $V_i$：
 
 $$
-\text{head}_i = \text{Attention}(Q_i W_i^Q,\; K_{\lfloor i / g \rfloor} W^K,\; V_{\lfloor i / g \rfloor} W^V)
+\text{head}_{i \cdot g + j} = \text{Attention}(Q_{i \cdot g + j}, K_i, V_i), \quad j = 0, 1, \ldots, g-1
 $$
 
-其中 $g$ 是每组的 Query 头数，$\lfloor i / g \rfloor$ 表示第 $i$ 个 Query 头对应第几组 KV。
+最终输出仍然是所有头的拼接：
 
-GQA 将 KV Cache 的大小压缩为原来的 $1/g$，推理速度和显存占用大幅改善，质量损失几乎可以忽略。
+$$
+\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_0, \ldots, \text{head}_{n_{\text{heads}}-1}) W^O
+$$
 
-> GQA 的详细原理和完整代码见 → [`GQA.md`](GQA.md)
-
-### 3.2 上下文长度：2K → 4K
-
-LLaMA 2 把训练时的上下文长度从 2048 扩展到 4096。这看起来只是一个参数变化，但背后需要确保 RoPE 的频率设置在 4K 长度下仍然能稳定区分位置，不会出现"旋转角度撞车"的问题。
-
-LLaMA 2 沿用了 LLaMA 1 的 RoPE 频率设置（$\theta = 10000$），在 4K 长度内表现良好。
-
----
-
-## 4. LLaMA 3：GQA 全面普及，上下文扩展到 128K
-
-LLaMA 3 在 Attention 上的主要进展有两点：
-
-### 4.1 全系列采用 GQA
-
-LLaMA 2 只在 70B 版本中用 GQA，LLaMA 3 把 GQA 推广到**所有规模**（8B、70B、405B）。这反映了 GQA 已经被充分验证为"无损压缩"：不需要为小模型保留 MHA。
-
-LLaMA 3.1（405B）的具体配置：
-
-| 参数 | 数值 |
-|:---|:---:|
-| 总层数 | 126 |
-| Query 头数 | 128 |
-| KV 头数 | 8 |
-| 头维度 | 128 |
-| 每组 Query 头数 | 16 |
-
-每 16 个 Query 头共享 1 对 KV，KV Cache 压缩为 MHA 的 $1/16$。
-
-### 4.2 RoPE 频率调整，支持 128K 上下文
-
-从 4K 扩展到 128K，RoPE 的频率参数 $\theta$ 需要相应调整。LLaMA 3 把 $\theta$ 从 $10000$ 提升到 $500000$，使得低频维度（对应长程位置关系）的旋转角度更密，能够在更长的序列上保持足够的分辨率。
-
-直觉理解：$\theta$ 越大，最低频的旋转完成一圈所需的 token 数越多，也就能"看得更远"而不混淆。
-
----
-
-## 5. 三个版本的架构演化对比
-
-| | LLaMA 1 | LLaMA 2 | LLaMA 3 |
-|:---|:---:|:---:|:---:|
-| 基础架构 | Decoder-Only | Decoder-Only | Decoder-Only |
-| 位置编码 | RoPE（$\theta=10000$） | RoPE（$\theta=10000$） | RoPE（$\theta=500000$） |
-| Attention 类型 | MHA | MHA（7B/13B）/ GQA（70B） | GQA（全系列） |
-| 上下文长度 | 2K | 4K | 8K–128K |
-| 归一化 | Pre-RMSNorm | Pre-RMSNorm | Pre-RMSNorm |
-| 激活函数 | SwiGLU | SwiGLU | SwiGLU |
-| 参数规模 | 7B–65B | 7B–70B | 8B–405B |
-
----
-
-## 6. 完整模块伪代码
+#### GQA 的代码实现
 
 ```python
-def llama_attention(x, layer_idx, config):
-    B, T, d = x.shape
-    head_dim = d // config.n_heads
-
-    # 线性投影：Q 有 n_heads 个头，KV 只有 n_kv_heads 个头（GQA）
-    Q = x @ W_Q   # (B, T, n_heads * head_dim)
-    K = x @ W_K   # (B, T, n_kv_heads * head_dim)
-    V = x @ W_V   # (B, T, n_kv_heads * head_dim)
-
-    # reshape 为多头形式
-    Q = Q.view(B, T, config.n_heads, head_dim).transpose(1, 2)
-    K = K.view(B, T, config.n_kv_heads, head_dim).transpose(1, 2)
-    V = V.view(B, T, config.n_kv_heads, head_dim).transpose(1, 2)
-
-    # 施加 RoPE：只对 Q 和 K，不对 V
-    Q = apply_rope(Q, cos[T], sin[T])
-    K = apply_rope(K, cos[T], sin[T])
-
-    # GQA：将 KV 重复扩展，对齐 Q 的头数
-    # 每 (n_heads // n_kv_heads) 个 Q 头共享同一对 KV
-    n_rep = config.n_heads // config.n_kv_heads
-    K = K.repeat_interleave(n_rep, dim=1)   # (B, n_heads, T, head_dim)
-    V = V.repeat_interleave(n_rep, dim=1)
-
-    # 标准 Scaled Dot-Product Attention + 因果掩码
+def grouped_query_attention(x, n_heads, n_kv_heads):
+    """
+    x: (batch, seq_len, d_model)
+    n_heads: 查询头的数量（如 32）
+    n_kv_heads: KV 头的数量（如 8）
+    """
+    batch, seq_len, d_model = x.shape
+    head_dim = d_model // n_heads
+    group_size = n_heads // n_kv_heads  # 每组有多少个查询头
+    
+    # 投影：Q 有 n_heads 个头，K 和 V 只有 n_kv_heads 个头
+    Q = x @ W_Q  # (batch, seq_len, n_heads * head_dim)
+    K = x @ W_K  # (batch, seq_len, n_kv_heads * head_dim)
+    V = x @ W_V  # (batch, seq_len, n_kv_heads * head_dim)
+    
+    # 重塑形状
+    Q = Q.view(batch, seq_len, n_heads, head_dim).transpose(1, 2)
+    K = K.view(batch, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+    V = V.view(batch, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+    
+    # 对 Q 和 K 施加 RoPE
+    Q = apply_rope(Q, cos, sin)
+    K = apply_rope(K, cos, sin)
+    
+    # 把 K 和 V 复制 group_size 次，让每组查询头都能访问
+    K = K.repeat_interleave(group_size, dim=1)  # (batch, n_heads, seq_len, head_dim)
+    V = V.repeat_interleave(group_size, dim=1)
+    
+    # 标准注意力计算
     scores = (Q @ K.transpose(-2, -1)) / math.sqrt(head_dim)
-    scores = scores + causal_mask[:T, :T]
+    scores = scores + mask
     weights = scores.softmax(dim=-1)
-    out = weights @ V   # (B, n_heads, T, head_dim)
-
-    # 合并多头，过输出投影
-    out = out.transpose(1, 2).contiguous().view(B, T, d)
+    out = weights @ V  # (batch, n_heads, seq_len, head_dim)
+    
+    # 拼接所有头
+    out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
     return out @ W_O
+```
+
+#### GQA 的效果
+
+| 方法 | KV Cache 大小 | 质量 | 推理速度 |
+|:---|:---:|:---:|:---:|
+| MHA | $n_{\text{heads}} \times d_{\text{head}}$ | 最高 | 最慢 |
+| GQA | $n_{\text{kv\_heads}} \times d_{\text{head}}$ | 接近 MHA | 中等 |
+| MQA | $1 \times d_{\text{head}}$ | 略有下降 | 最快 |
+
+LLaMA 2 的实验表明，GQA 在几乎不损失质量的前提下，显著降低了推理时的显存占用和延迟。
+
+### 3.2 上下文长度扩展到 4096
+
+LLaMA 2 将上下文长度从 2048 扩展到 **4096 tokens**。为了让 RoPE 适应更长的序列，训练时使用了更长的文本数据，并在推理时保持相同的频率参数 $\theta = 10000$。
+
+### 3.3 LLaMA 2 的架构超参数
+
+LLaMA 2 发布了三个规模的模型：
+
+| 模型 | 层数 | 隐藏维度 | Q 头数 | KV 头数 | 上下文长度 | 参数量 |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| LLaMA 2-7B | 32 | 4096 | 32 | 32 | 4096 | 6.7B |
+| LLaMA 2-13B | 40 | 5120 | 40 | 40 | 4096 | 13.0B |
+| LLaMA 2-70B | 80 | 8192 | 64 | 8 | 4096 | 68.9B |
+
+注意 7B 和 13B 仍然使用 MHA（Q 头数 = KV 头数），只有 70B 使用了 GQA（64 个 Q 头，8 个 KV 头）。
+
+训练数据总量约 **2T tokens**，比 LLaMA 1 增加了 40%。
+
+### 3.4 LLaMA 2-Chat：对齐人类偏好
+
+LLaMA 2 还发布了经过对齐训练的 **LLaMA 2-Chat** 版本，使用了 **RLHF（Reinforcement Learning from Human Feedback）** 技术，包括：
+
+1. **监督微调（SFT）**：在高质量对话数据上微调
+2. **奖励建模（Reward Modeling）**：训练一个奖励模型来评估回复质量
+3. **PPO 优化**：用强化学习进一步优化模型
+
+这些技术不改变 Attention 的结构，但让模型更适合对话场景。
+
+---
+
+## 4. LLaMA 3：迈向 128K 上下文和多模态
+
+LLaMA 3 在 2024 年发布，是 LLaMA 系列的一次重大升级，不仅扩展了上下文长度，还引入了多模态能力。
+
+### 4.1 上下文长度扩展到 128K
+
+LLaMA 3.1 将上下文长度从 4096 大幅扩展到 **128K tokens**，这是一个 32 倍的提升。为了实现这一点，Meta 做了以下改进：
+
+#### RoPE 频率调整
+
+原始 RoPE 的频率参数 $\theta = 10000$ 是为短序列设计的。当序列长度超过训练长度时，高频分量会导致位置编码失效。
+
+LLaMA 3 将 RoPE 的基础频率从 $\theta = 10000$ 提升到 **$\theta = 500000$**：
+
+$$
+\theta_i = \frac{1}{500000^{2i / d}}
+$$
+
+这样做的效果是让位置编码的"波长"变长，使得模型能够更好地处理长距离依赖。
+
+#### 长上下文训练
+
+LLaMA 3.1 在训练的最后阶段，使用了大量长文本数据（平均长度超过 8K tokens）进行继续训练，让模型逐步适应更长的上下文。
+
+### 4.2 架构改进：全面采用 GQA
+
+LLaMA 3 的所有规模模型都采用了 **GQA**，不再使用 MHA：
+
+| 模型 | 层数 | 隐藏维度 | Q 头数 | KV 头数 | 上下文长度 | 参数量 |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| LLaMA 3-8B | 32 | 4096 | 32 | 8 | 8K / 128K | 8.0B |
+| LLaMA 3-70B | 80 | 8192 | 64 | 8 | 8K / 128K | 70.6B |
+| LLaMA 3-405B | 126 | 16384 | 128 | 8 | 8K / 128K | 405.0B |
+
+注意所有模型的 KV 头数都固定为 **8**，这是一个经过实验验证的最佳平衡点。
+
+### 4.3 训练数据规模的飞跃
+
+LLaMA 3 的训练数据总量达到 **15T tokens**，是 LLaMA 2 的 7.5 倍。数据来源包括：
+
+- 公开网页数据（经过严格过滤）
+- 代码数据（GitHub、StackOverflow 等）
+- 多语言数据（覆盖 30+ 种语言）
+- 长文本数据（用于长上下文训练）
+
+### 4.4 多模态能力：LLaMA 3.2
+
+LLaMA 3.2 引入了 **视觉编码器**，支持图像输入。架构上采用了类似 CLIP 的设计：
+
+1. **视觉编码器**：将图像编码为一组视觉 token
+2. **跨模态适配器**：将视觉 token 投影到语言模型的嵌入空间
+3. **语言模型**：处理文本和视觉 token 的混合序列
+
+在 Attention 层面，视觉 token 和文本 token 使用相同的 Self-Attention 机制，没有特殊处理。
+
+### 4.5 LLaMA 3 的 Attention 计算
+
+LLaMA 3 的 Attention 计算与 LLaMA 2 基本相同，只是 RoPE 的频率参数更大：
+
+```python
+def llama3_attention(x, n_heads, n_kv_heads, theta=500000):
+    """
+    LLaMA 3 的注意力计算，支持 128K 上下文
+    """
+    batch, seq_len, d_model = x.shape
+    head_dim = d_model // n_heads
+    group_size = n_heads // n_kv_heads
+    
+    # 投影
+    Q = x @ W_Q
+    K = x @ W_K
+    V = x @ W_V
+    
+    # 重塑形状
+    Q = Q.view(batch, seq_len, n_heads, head_dim).transpose(1, 2)
+    K = K.view(batch, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+    V = V.view(batch, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+    
+    # 计算 RoPE（使用更大的 theta）
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    pos = torch.arange(seq_len)
+    angles = pos[:, None] * freqs[None, :]  # (seq_len, head_dim // 2)
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    
+    # 对 Q 和 K 施加 RoPE
+    Q = apply_rope(Q, cos, sin)
+    K = apply_rope(K, cos, sin)
+    
+    # GQA：复制 K 和 V
+    K = K.repeat_interleave(group_size, dim=1)
+    V = V.repeat_interleave(group_size, dim=1)
+    
+    # 标准注意力
+    scores = (Q @ K.transpose(-2, -1)) / math.sqrt(head_dim)
+    scores = scores + mask
+    weights = scores.softmax(dim=-1)
+    out = weights @ V
+    
+    # 拼接并输出
+    out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
+    return out @ W_O
+```
+
+关键变化只有一行：`theta=500000`，但这一行让模型能够处理 128K 的超长上下文。
+
+---
+
+## 5. LLaMA 4：引入 MLA，迈向极致效率
+
+LLaMA 4 在 2025 年发布，是 LLaMA 系列的最新版本，引入了 **MLA（Multi-Head Latent Attention，多头潜在注意力）** 机制，进一步优化了推理效率。
+
+### 5.1 MLA：比 GQA 更激进的压缩
+
+GQA 通过让多个查询头共享 KV 来减少 KV Cache，但 K 和 V 本身仍然是高维向量（维度等于 $d_{\text{head}}$）。
+
+**MLA** 的核心思想是：在生成 K 和 V 之前，先把输入 $x$ 压缩到一个**低维潜在空间**，然后再从这个潜在表示中生成 K 和 V。
+
+#### MLA 的数学表示
+
+传统的 GQA 中，K 和V 的生成方式是：
+
+$$
+K = xW_K, \quad V = xW_V
+$$
+
+其中 $W_K$ 和 $W_V$ 的形状是 $(d_{\text{model}}, n_{\text{kv\_heads}} \times d_{\text{head}})$。
+
+MLA 引入了一个**潜在向量** $c$，维度远小于 $d_{\text{model}}$：
+
+$$
+c = xW_c, \quad \text{其中 } W_c \in \mathbb{R}^{d_{\text{model}} \times d_c}, \quad d_c \ll d_{\text{model}}
+$$
+
+然后从 $c$ 生成 K 和 V：
+
+$$
+K = cW_{cK}, \quad V = cW_{cV}
+$$
+
+其中 $W_{cK}, W_{cV} \in \mathbb{R}^{d_c \times (n_{\text{kv\_heads}} \times d_{\text{head}})}$。
+
+这样做的好处是：**KV Cache 中只需要存储低维的 $c$，而不是高维的 K 和 V**。在推理时，每次从缓存的 $c$ 重新计算 K 和 V，虽然增加了一点计算量，但大幅减少了显存占用。
+
+#### MLA 的显存节省
+
+假设 $d_{\text{model}} = 8192$，$n_{\text{kv\_heads}} = 8$，$d_{\text{head}} = 128$，$d_c = 512$：
+
+- **GQA 的 KV Cache**：每个 token 需要存储 $2 \times n_{\text{kv\_heads}} \times d_{\text{head}} = 2 \times 8 \times 128 = 2048$ 个浮点数
+- **MLA 的 KV Cache**：每个 token 只需要存储 $d_c = 512$ 个浮点数
+
+显存节省比例：$2048 / 512 = 4$ 倍。
+
+#### MLA 的代码实现
+
+```python
+def multi_head_latent_attention(x, n_heads, n_kv_heads, d_c):
+    """
+    x: (batch, seq_len, d_model)
+    n_heads: 查询头数量
+    n_kv_heads: KV 头数量
+    d_c: 潜在向量维度
+    """
+    batch, seq_len, d_model = x.shape
+    head_dim = d_model // n_heads
+    group_size = n_heads // n_kv_heads
+    
+    # 生成 Q（标准方式）
+    Q = x @ W_Q  # (batch, seq_len, n_heads * head_dim)
+    Q = Q.view(batch, seq_len, n_heads, head_dim).transpose(1, 2)
+    
+    # 生成潜在向量 c（低维压缩）
+    c = x @ W_c  # (batch, seq_len, d_c)
+    
+    # 从 c 生成 K 和 V
+    K = c @ W_cK  # (batch, seq_len, n_kv_heads * head_dim)
+    V = c @ W_cV  # (batch, seq_len, n_kv_heads * head_dim)
+    
+    K = K.view(batch, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+    V = V.view(batch, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+    
+    # 对 Q 和 K 施加 RoPE
+    Q = apply_rope(Q, cos, sin)
+    K = apply_rope(K, cos, sin)
+    
+    # GQA：复制 K 和 V
+    K = K.repeat_interleave(group_size, dim=1)
+    V = V.repeat_interleave(group_size, dim=1)
+    
+    # 标准注意力
+    scores = (Q @ K.transpose(-2, -1)) / math.sqrt(head_dim)
+    scores = scores + mask
+    weights = scores.softmax(dim=-1)
+    out = weights @ V
+    
+    # 拼接并输出
+    out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
+    return out @ W_O
+```
+
+在推理时，KV Cache 中存储的是 $c$，而不是 K 和 V：
+
+```python
+# 推理时的 KV Cache 更新
+def update_kv_cache_mla(cache, new_c):
+    """
+    cache: 已缓存的潜在向量 c，形状 (batch, cached_len, d_c)
+    new_c: 新生成的潜在向量，形状 (batch, 1, d_c)
+    """
+    # 直接拼接，显存占用远小于传统 KV Cache
+    return torch.cat([cache, new_c], dim=1)
+
+# 从缓存的 c 重新计算 K 和 V
+def compute_kv_from_cache(c_cache):
+    K = c_cache @ W_cK
+    V = c_cache @ W_cV
+    return K, V
+```
+
+### 5.2 LLaMA 4 的架构超参数
+
+LLaMA 4 目前发布了以下规模的模型：
+
+| 模型 | 层数 | 隐藏维度 | Q 头数 | KV 头数 | 潜在维度 $d_c$ | 上下文长度 | 参数量 |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| LLaMA 4-8B | 32 | 4096 | 32 | 8 | 512 | 128K | 8.0B |
+| LLaMA 4-70B | 80 | 8192 | 64 | 8 | 1024 | 128K | 70.6B |
+| LLaMA 4-405B | 126 | 16384 | 128 | 8 | 2048 | 128K | 405.0B |
+
+所有模型都使用 MLA，并保持 128K 的上下文长度。
+
+### 5.3 训练数据和训练策略
+
+LLaMA 4 的训练数据总量超过 **20T tokens**，并采用了更先进的训练策略：
+
+- **课程学习（Curriculum Learning）**：从短序列逐步过渡到长序列
+- **混合精度训练**：使用 BF16 和 FP8 混合精度，提升训练效率
+- **分布式训练优化**：在数千个 GPU 上进行大规模并行训练
+
+### 5.4 MLA 的效果
+
+| 方法 | KV Cache 大小（每 token） | 质量 | 推理速度 |
+|:---|:---:|:---:|:---:|
+| MHA | $2 \times n_{\text{heads}} \times d_{\text{head}}$ | 最高 | 最慢 |
+| GQA | $2 \times n_{\text{kv\_heads}} \times d_{\text{head}}$ | 接近 MHA | 中等 |
+| MLA | $d_c$ | 接近 GQA | 最快 |
+
+LLaMA 4 的实验表明，MLA 在几乎不损失质量的前提下，将 KV Cache 的大小减少到 GQA 的 **1/4**，使得在消费级硬件上部署超大模型成为可能。
+
+---
+
+## 6. LLaMA 系列的演进对比
+
+下表总结了 LLaMA 1 到 4 在 Attention 机制上的关键演进：
+
+| 特性 | LLaMA 1 | LLaMA 2 | LLaMA 3 | LLaMA 4 |
+|:---|:---|:---|:---|:---|
+| **位置编码** | RoPE ($\theta=10000$) | RoPE ($\theta=10000$) | RoPE ($\theta=500000$) | RoPE ($\theta=500000$) |
+| **注意力机制** | MHA | MHA / GQA | GQA | MLA |
+| **KV 头数** | = Q 头数 | 7B/13B: = Q 头数<br>70B: 8 | 全部: 8 | 全部: 8 |
+| **潜在维度** | - | - | - | 512 / 1024 / 2048 |
+| **上下文长度** | 2048 | 4096 | 8K / 128K | 128K |
+| **训练数据量** | 1.4T tokens | 2T tokens | 15T tokens | 20T+ tokens |
+| **KV Cache 大小**<br>（相对 MHA） | 1× | 7B/13B: 1×<br>70B: 1/8× | 1/8× | 1/32× |
+| **推理效率** | 基准 | 70B 提升明显 | 全系列提升 | 最优 |
+
+### 关键演进路径
+
+1. **LLaMA 1 → LLaMA 2**：引入 GQA，开始优化推理效率
+2. **LLaMA 2 → LLaMA 3**：全面采用 GQA，大幅扩展上下文长度（4K → 128K）
+3. **LLaMA 3 → LLaMA 4**：引入 MLA，将 KV Cache 压缩到极致
+
+---
+
+## 7. 完整的 LLaMA 4 模块代码
+
+下面是一个完整的 LLaMA 4 Transformer 层的实现，包含 MLA、RoPE、RMSNorm 和 SwiGLU：
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x):
+        # 计算均方根
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        # 归一化并缩放
+        return x / rms * self.weight
+
+
+class RoPE(nn.Module):
+    def __init__(self, dim, max_seq_len=128000, theta=500000):
+        super().__init__()
+        # 预计算频率
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        pos = torch.arange(max_seq_len)
+        angles = pos[:, None] * freqs[None, :]  # (max_seq_len, dim // 2)
+        # 预计算 cos 和 sin
+        self.register_buffer('cos', torch.cos(angles))
+        self.register_buffer('sin', torch.sin(angles))
+    
+    def forward(self, x, seq_len):
+        """
+        x: (batch, heads, seq_len, head_dim)
+        """
+        cos = self.cos[:seq_len, :]  # (seq_len, head_dim // 2)
+        sin = self.sin[:seq_len, :]
+        
+        # 拆分奇偶维度
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        # 旋转变换
+        x_rotated_1 = x1 * cos - x2 * sin
+        x_rotated_2 = x1 * sin + x2 * cos
+        # 交错合并
+        return torch.stack([x_rotated_1, x_rotated_2], dim=-1).flatten(-2)
+
+
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads, d_c):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = d_model // n_heads
+        self.group_size = n_heads // n_kv_heads
+        
+        # Q 投影（标准）
+        self.W_Q = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        
+        # 潜在向量投影（低维压缩）
+        self.W_c = nn.Linear(d_model, d_c, bias=False)
+        
+        # 从潜在向量生成 K 和 V
+        self.W_cK = nn.Linear(d_c, n_kv_heads * self.head_dim, bias=False)
+        self.W_cV = nn.Linear(d_c, n_kv_heads * self.head_dim, bias=False)
+        
+        # 输出投影
+        self.W_O = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+        
+        # RoPE
+        self.rope = RoPE(self.head_dim)
+    
+    def forward(self, x, mask=None, use_cache=False, past_c=None):
+        batch, seq_len, d_model = x.shape
+        
+        # 生成 Q
+        Q = self.W_Q(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # 生成潜在向量 c
+        c = self.W_c(x)  # (batch, seq_len, d_c)
+        
+        # 如果使用缓存，拼接历史 c
+        if use_cache and past_c is not None:
+            c = torch.cat([past_c, c], dim=1)
+        
+        # 从 c 生成 K 和 V
+        K = self.W_cK(c).view(batch, -1, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        V = self.W_cV(c).view(batch, -1, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        
+        # 对 Q 和 K 施加 RoPE
+        Q = self.rope(Q, seq_len)
+        K = self.rope(K, c.size(1))
+        
+        # GQA：复制 K 和 V
+        K = K.repeat_interleave(self.group_size, dim=1)
+        V = V.repeat_interleave(self.group_size, dim=1)
+        
+        # 计算注意力
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask
+        weights = scores.softmax(dim=-1)
+        out = weights @ V  # (batch, n_heads, seq_len, head_dim)
+        
+        # 拼接所有头
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        out = self.W_O(out)
+        
+        # 返回输出和更新后的 c（用于缓存）
+        return out, c if use_cache else None
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W = nn.Linear(d_model, d_ff, bias=False)
+        self.V = nn.Linear(d_model, d_ff, bias=False)
+        self.W2 = nn.Linear(d_ff, d_model, bias=False)
+    
+    def forward(self, x):
+        # SwiGLU: (xW ⊙ Swish(xV)) W2
+        return self.W2(self.W(x) * torch.nn.functional.silu(self.V(x)))
+
+
+class LLaMA4TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads, d_c, d_ff):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.attn = MultiHeadLatentAttention(d_model, n_heads, n_kv_heads, d_c)
+        self.ffn_norm = RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model, d_ff)
+    
+    def forward(self, x, mask=None, use_cache=False, past_c=None):
+        # Pre-Norm + Attention + 残差连接
+        attn_out, new_c = self.attn(self.attn_norm(x), mask, use_cache, past_c)
+        x = x + attn_out
+        
+        # Pre-Norm + FFN + 残差连接
+        x = x + self.ffn(self.ffn_norm(x))
+        
+        return x, new_c
+
+
+# 使用示例
+if __name__ == "__main__":
+    # LLaMA 4-8B 的配置
+    d_model = 4096
+    n_heads = 32
+    n_kv_heads = 8
+    d_c = 512
+    d_ff = 14336  # 通常是 d_model 的 3.5 倍
+    
+    block = LLaMA4TransformerBlock(d_model, n_heads, n_kv_heads, d_c, d_ff)
+    
+    # 输入：batch=2, seq_len=10, d_model=4096
+    x = torch.randn(2, 10, d_model)
+    
+    # 前向传播
+    out, c_cache = block(x, use_cache=True)
+    print(f"输出形状: {out.shape}")  # (2, 10, 4096)
+    print(f"缓存形状: {c_cache.shape}")  # (2, 10, 512)
+    print(f"KV Cache 压缩比: {d_model / d_c:.1f}x")  # 8.0x
 ```
 
 ---
 
-## 7. 初学者常见混淆
+## 8. 常见混淆问题
 
-**Q：LLaMA 的 RoPE 和原始 Transformer 的位置编码有什么本质区别？**
+**Q：RoPE 和原始 Transformer 的正弦余弦位置编码有什么本质区别？**
 
-原始 Transformer 的位置信息是"加"到词向量里的，在进入 Attention 之前就固定了。RoPE 是在 Attention 计算**内部**、对 Q 和 K 做旋转，位置关系在点积计算时才体现出来。
+原始 Transformer 的位置信息是"加"到词向量里的，在进入 Attention 之前就固定了。RoPE 是在 Attention 计算**内部**、对 Q 和 K 做旋转，位置关系在点积计算时才体现出来。这让 RoPE 能够更自然地建模相对位置关系。
 
 **Q：GQA 和 MHA 的质量差距大吗？**
 
-论文和工业实践都表明，当 KV 头数不太少时（比如 8 组以上），GQA 与 MHA 的质量差距极小，而推理速度和显存优势非常显著。LLaMA 3 405B 全系列使用 GQA 就是最好的证明。
+论文和工业实践都表明，当 KV 头数不太少时（比如 8 组以上），GQA 与 MHA 的质量差距极小，而推理速度和显存优势非常显著。LLaMA 3 和 4 全系列使用 GQA 就是最好的证明。
+
+**Q：MLA 相比 GQA 的优势在哪里？**
+
+MLA 通过引入低维潜在向量 $c$，将 KV Cache 的大小进一步压缩到 GQA 的 1/4。这使得在相同显存下可以支持更长的上下文或更大的批次，对于部署超大模型尤其重要。
 
 **Q：LLaMA 3 的 128K 上下文是训练时就支持的，还是靠推理时扩展的？**
 
-LLaMA 3.1 是在长文本数据上继续训练（long-context fine-tuning）并配合 RoPE 频率调整来实现的，不是纯靠推理时的 trick 外推。
+LLaMA 3.1 是在长文本数据上继续训练（long-context fine-tuning）并配合 RoPE 频率调整（$\theta$ 从 10000 提升到 500000）来实现的，不是纯靠推理时的 trick 外推。
 
-**Q：LLaMA 系列是否改动了 Attention 的计算公式本身？**
+**Q：为什么 LLaMA 系列不改变 Attention 的核心公式？**
 
-没有。$\text{softmax}(QK^\top / \sqrt{d_k})V$ 这个公式一字未动。LLaMA 的改动是在**准备 Q 和 K 的方式**（RoPE）和**KV 的组织方式**（GQA）上，而不是 Attention 的核心数学。
+$\text{softmax}(QK^\top / \sqrt{d_k})V$ 这个公式已经被证明非常有效。LLaMA 的改进策略是在**准备 Q 和 K 的方式**（RoPE）和 **KV 的组织与存储方式**（GQA、MLA）上做优化，而不是改变 Attention 的核心数学。
+
+**Q：为什么所有 LLaMA 模型的 KV 头数都固定为 8？**
+
+这是经过大量实验验证的最佳平衡点。8 个 KV 头既能保证模型质量（接近 MHA），又能显著降低 KV Cache 的大小（降到 MHA 的 1/8）。更少的 KV 头会导致质量下降，更多则收益递减。
+
+**Q：MLA 的潜在维度 $d_c$ 是如何选择的？**
+
+$d_c$ 通常设置为 $d_{\text{model}}$ 的 1/8 到 1/4。LLaMA 4-8B 使用 $d_c = 512$（$d_{\text{model}} = 4096$ 的 1/8），LLaMA 4-405B 使用 $d_c = 2048$（$d_{\text{model}} = 16384$ 的 1/8）。这个比例在质量和效率之间取得了良好平衡。
 
 ---
 
-## 8. 读完这篇之后，你应该能回答这些问题
+## 9. 读完这篇之后，你应该能回答这些问题
 
 - LLaMA 系列为什么选择用 RoPE 而不是绝对位置编码？RoPE 的旋转操作在数学上是如何把相对位置信息编入注意力计算的？
 - GQA 相比 MHA 在推理时节省了什么？节省的比例和什么参数有关？
-- LLaMA 1、2、3 在 Attention 机制上各做了什么具体改进？
+- MLA 相比 GQA 做了什么进一步的优化？潜在向量 $c$ 的作用是什么？
+- LLaMA 1、2、3、4 在 Attention 机制上各做了什么具体改进？演进路径是什么？
 - 为什么要把 RoPE 的频率参数 $\theta$ 从 10000 提升到 500000 才能支持 128K 上下文？
 - `apply_rope` 函数对向量做的是什么变换？为什么只对 Q 和 K 做，不对 V 做？
+- LLaMA 4 的 MLA 如何在推理时使用 KV Cache？为什么存储 $c$ 比存储 K 和 V 更高效？
+- 从 MHA 到 GQA 到 MLA，KV Cache 的大小分别是多少？压缩比是多少？
 
 ---
 
 ## 参考资料
 
-- `paper/LLaMA-LLaMA-Open-and-Efficient-Foundation-LMs.pdf`
-- `paper/LLaMA2-Open-Foundation-and-Fine-Tuned-Chat-Models.pdf`
-- The Llama 3 Herd of Models: https://arxiv.org/abs/2407.21783
+- LLaMA 1 论文：`paper/LLaMA-LLaMA-Open-and-Efficient-Foundation-LMs.pdf`
+- LLaMA 2 论文：`paper/LLaMA2-Open-Foundation-and-Fine-Tuned-Chat-Models.pdf`
+- LLaMA 3 论文：`paper/LLaMA3-Llama3-Herd-of-Models.pdf`
+- LLaMA 4 论文：`paper/LLaMA4-Herd-Architecture-Training.pdf`
 - RoFormer（RoPE 原论文）: https://arxiv.org/abs/2104.09864
+- GQA 论文：https://arxiv.org/abs/2305.13245
+- MLA 相关技术：DeepSeek-V2 论文 https://arxiv.org/abs/2405.04434
+
